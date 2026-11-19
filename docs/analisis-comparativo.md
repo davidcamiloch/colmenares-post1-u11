@@ -52,6 +52,70 @@ En BERT-Large la GPU lidera porque la atención exige matrices grandes y mucha m
 
 En Stable Diffusion XL la H200 rinde cerca de 1.9 veces lo que rinde una Trillium por acelerador (Byrne, 2024). La guía pide latencias p99 de BERT; MLPerf no publica la latencia p99 de cada sistema en el escenario server. Publica el throughput sostenido bajo el límite de 130 ms. El documento reporta ese dato real en lugar de estimar una latencia.
 
+## 3. Análisis costo-rendimiento y TCO
+
+El rendimiento en TOPS no basta para decidir. El análisis combina tres costos: adquisición; energía; desarrollo y mantenimiento. Los precios se consultaron en noviembre de 2026.
+
+| Acelerador | Costo de adquisición o alquiler | Fuente | Potencia |
+|---|---|---|---|
+| NVIDIA H100 SXM | 30 000 USD instalados por GPU (supuesto de presupuesto); alquiler desde 3.49 USD por GPU-hora | Jarvislabs (2026) | 700 W |
+| TPU v5e | 1.20 USD por chip-hora bajo demanda; 0.54 USD con compromiso de 3 años | Google Cloud (s.f.-a) | Incluida en la tarifa |
+| TPU v4 pod | 3.22 USD por chip-hora bajo demanda | Google Cloud (s.f.-a) | Incluida en la tarifa |
+| FPGA AMD Alveo U55C | 4 747 USD | AMD (s.f.) | 115 W típica |
+| Apple Mac Studio M3 Ultra | 3 999 USD con 96 GB de memoria unificada | Haslam (2025) | No publicada para el Neural Engine |
+
+La guía estima la U55C en 8 000 USD y la TPU v4 en 32 USD por hora. El precio de lista de AMD es 4 747 USD. La tarifa de Google es por chip; 32 USD por hora corresponde a un slice de unos 10 chips v4.
+
+El costo de energía a 3 años se calcula con 26 280 horas; una tarifa supuesta de 0.15 USD por kWh; un PUE supuesto de 1.5 para el centro de datos. Ambos supuestos son explícitos y el lector puede cambiarlos.
+
+$$E_{3a} = P \times 26\,280\ \text{h} \times 0.15\ \tfrac{\text{USD}}{\text{kWh}} \times 1.5$$
+
+Con esa fórmula una H100 a 700 W consume 4 139 USD en 3 años; una U55C a 115 W consume 680 USD; una T4 a 70 W consume 414 USD.
+
+### Escenario (a): startup de IA con inferencia en la nube a menos de 100 solicitudes por segundo
+
+Una H200 sostiene 94 620 muestras por segundo de ResNet-50 (Eassa et al., 2024). Cien solicitudes por segundo usan menos del 0.2 % de esa capacidad. Comprar una H100 cuesta 34 139 USD a 3 años con energía y deja la GPU ociosa casi todo el tiempo. Un chip TPU v5e reservado 3 años cuesta 14 191 USD y no exige operar hardware. Alquilar una H100 todo el tiempo costaría 91 717 USD.
+
+El análisis concluye que la startup debe consumir aceleradores pequeños en la nube y pagar por uso: un chip TPU v5e o una instancia con T4. El costo dominante a esta escala es el de ingeniería; la nube lo reduce porque elimina compras, refrigeración y repuestos.
+
+### Escenario (b): empresa con inferencia en el borde
+
+En un smartphone o una cámara la NPU ya viene dentro del SoC. Su costo marginal es casi cero y su consumo está en pocos vatios. Un Neural Engine de 18 TOPS basta para clasificación y detección ligeras. En una cámara industrial con requisito de latencia fija la FPGA ofrece 4 747 USD más 680 USD de energía por nodo a 3 años. En un vehículo autónomo la carga mezcla varias redes y sensores; ahí una GPU embebida o un SoC con NPU grande da más flexibilidad.
+
+La regla del escenario de borde es usar la NPU del SoC cuando existe; la FPGA cuando la latencia debe ser determinística; la GPU cuando la carga cambia a menudo.
+
+## 4. Recomendación fundamentada por perfil
+
+### Perfil A: laboratorio universitario con 10 000 USD, visión y NLP hasta 7B parámetros
+
+Recomendación: GPU NVIDIA H100 alquilada por horas, complementada con una estación local modesta.
+
+1. Memoria. Un modelo de 7B en BF16 ocupa 14 GB de pesos. El ajuste fino completo con Adam requiere cerca de 16 bytes por parámetro: 112 GB. La H100 con 80 GB admite inferencia y ajuste fino con LoRA; la TPU v5e con 16 GiB por chip obliga a repartir el modelo entre varios chips.
+2. Costo. Una H100 no cabe en el presupuesto: 30 000 USD instalados. Los 10 000 USD compran 2 865 horas de H100 a 3.49 USD por hora (Jarvislabs, 2026); suficientes para un año de experimentos de un grupo pequeño.
+3. Ecosistema. La mayoría del código de investigación en visión y NLP se publica para PyTorch con CUDA. El tiempo del investigador cuesta más que la hora de GPU.
+
+Limitaciones: las horas se agotan; los datos sensibles salen del campus; la disponibilidad de GPU varía. Un Mac Studio M3 Ultra de 3 999 USD con 96 GB ejecuta inferencia de modelos 7B localmente, pero su Neural Engine no sirve para entrenar y el backend de PyTorch para Apple es más lento que CUDA.
+
+### Perfil B: manufactura con inspección visual a menos de 5 ms en 50 líneas
+
+Recomendación: FPGA distribuida, una por línea, con modelo cuantizado a INT8 validado por clase.
+
+1. Latencia determinística. La FPGA ejecuta el pipeline fijo en hardware sin sistema operativo ni planificador. La latencia máxima es igual a la típica.
+2. Aislamiento de fallas. Una tarjeta dañada detiene una línea, no cincuenta.
+3. Consumo y ubicación. Una U55C consume 115 W típicos y no necesita red hasta un servidor central; la imagen se procesa junto a la cámara.
+
+Limitaciones: el desarrollo en HLS es más lento que en CUDA; cambiar de modelo exige volver a sintetizar; el capital inicial es mayor. Las decisiones técnicas de las secciones 6 y 7 desarrollan este perfil.
+
+### Perfil C: proveedor de nube que entrena modelos de 70B en clústeres de 512 aceleradores
+
+Recomendación: GPU H100 o H200 con NVLink y red InfiniBand; la TPU es la alternativa solo dentro de Google Cloud.
+
+1. Comunicación colectiva. La H100 ofrece 900 GB/s de NVLink por GPU (NVIDIA, s.f.-a). El entrenamiento de 70B parte el modelo entre GPU y sincroniza gradientes en cada paso; el ancho de banda entre aceleradores define la escalabilidad.
+2. Memoria. 80 GB de HBM3 a 3.35 TB/s por GPU permiten paralelismo de tensor con particiones grandes.
+3. Mercado. Un proveedor de nube vende capacidad a clientes que traen código CUDA; la GPU maximiza la demanda.
+
+Limitaciones: 512 H100 suman 15.36 millones de USD de capital y 358 kW solo en GPU. La TPU v4 escala a 4 096 chips con conmutadores ópticos y usa entre 1.3 y 1.9 veces menos energía que la A100 en sistemas de tamaño similar (Jouppi et al., 2023); sin embargo solo se alquila en Google Cloud y no se puede comprar.
+
 ## Referencias
 
 AMD. (s.f.). *AMD Alveo U55C high performance compute card*. Recuperado el 19 de noviembre de 2026 de https://www.amd.com/en/products/accelerators/alveo/u55c/a-u55c-p00g-pq-g.html
