@@ -116,6 +116,53 @@ Recomendación: GPU H100 o H200 con NVLink y red InfiniBand; la TPU es la altern
 
 Limitaciones: 512 H100 suman 15.36 millones de USD de capital y 358 kW solo en GPU. La TPU v4 escala a 4 096 chips con conmutadores ópticos y usa entre 1.3 y 1.9 veces menos energía que la A100 en sistemas de tamaño similar (Jouppi et al., 2023); sin embargo solo se alquila en Google Cloud y no se puede comprar.
 
+## 5. Cuantización INT8 vs FP32: efecto en throughput y precisión
+
+Las cifras de TOPS dependen de la precisión. En la misma generación de hardware INT8 duplica el pico de FP16 o BF16.
+
+| Hardware | FP32 | FP16/BF16 Tensor | INT8 Tensor | Relación INT8/FP16 | Fuente |
+|---|---|---|---|---|---|
+| NVIDIA T4 | 8.1 TFLOPS | 65 TFLOPS | 130 TOPS | 2.0× | NVIDIA (s.f.-b) |
+| NVIDIA H100 SXM (con sparsity) | 67 TFLOPS | 1 979 TFLOPS | 3 958 TOPS | 2.0× | NVIDIA (s.f.-a) |
+| TPU v5e | — | 197 TFLOPS | 393 TOPS | 2.0× | Google Cloud (s.f.-b) |
+
+La exactitud se mide con modelos reales. Wu et al. (2020) cuantizaron ResNet-50 v1.5 y BERT-Large con distintos métodos de calibración post-entrenamiento (PTQ) y con entrenamiento consciente de la cuantización (QAT).
+
+| Modelo | FP32 | INT8 PTQ max | INT8 PTQ entropía | INT8 PTQ percentil 99.99 % | INT8 PTQ percentil 99.999 % | INT8 QAT | Umbral MLPerf |
+|---|---|---|---|---|---|---|---|
+| ResNet-50 v1.5 (top-1 %) | 76.16 | 75.82 | 76.05 | 75.98 | 75.97 | 76.85 | 99 % de 76.46 = 75.70 |
+| BERT-Large (F1) | 91.01 | 85.92 | 37.40 | 89.59 | 90.20 | 90.67 | 99 % de 90.874 = 89.97; 99.9 % = 90.78 |
+
+Fuentes: Wu et al. (2020) para las exactitudes; MLCommons (s.f.) y Han y Kayrish (s.f.) para los umbrales.
+
+En ResNet-50 todas las calibraciones quedan a menos de 0.5 puntos del FP32. En BERT-Large la calibración por entropía hunde el F1 de 91.01 a 37.40. El mismo modelo con percentil 99.999 % pierde solo 0.81 puntos. La cuantización no es un cast: elegir mal la escala de una sola capa destruye el modelo. Un cast directo sin calibración es todavía peor porque ni siquiera ajusta la escala al rango real de las activaciones.
+
+MLPerf exige que un envío cuantizado conserve el 99 % de la exactitud FP32 de referencia; BERT y DLRM tienen además una categoría de 99.9 % (MLCommons, s.f.). La guía afirma que BERT siempre debe cumplir 99.9 %; las reglas publican las dos categorías y NVIDIA reporta ambas (Eassa et al., 2024). La calibración solo puede usar el conjunto de calibración que entrega MLPerf y el método debe publicarse para que sea reproducible (MLCommons, s.f.).
+
+## 6. Decisión técnica — ¿GPU centralizada o FPGA distribuida para el Perfil B?
+
+El análisis concluye que la FPGA distribuida es la opción correcta si el rechazo de piezas tiene implicaciones de seguridad. Las 50 líneas a 10 imágenes por segundo suman 500 imágenes por segundo. Una H200 sostiene 94 620 muestras por segundo de ResNet-50 (Eassa et al., 2024); un modelo tipo ResNet-18 es más liviano. La carga usa menos del 1 % de la capacidad de una GPU Hopper.
+
+El throughput sobra; la latencia no está garantizada. Si la GPU atiende las imágenes una por una con 1.5 ms de servicio, la utilización es 0.75. Un modelo de cola M/D/1 da una espera media de 2.25 ms y un tiempo medio de 3.75 ms; la cola de la distribución supera los 5 ms. Con 1.9 ms de servicio la espera media sube a 18 ms. La GPU solo cumple si ejecuta varias inferencias en paralelo con varios contextos de TensorRT o lotes pequeños.
+
+En capital la GPU gana con claridad. Un servidor con H100 cuesta 30 000 USD instalados (Jarvislabs, 2026). Cincuenta U55C cuestan 400 000 USD con el precio de la guía y 237 350 USD con el precio de lista de AMD (AMD, s.f.). La centralización agrega dos riesgos: un punto único de falla que deja sin inspección a las 50 líneas; jitter del sistema operativo, del driver y de la red entre cámara y servidor.
+
+El estudiante decide FPGA por línea para un sistema de seguridad industrial. Si la inspección es solo control de calidad, la GPU centralizada con un segundo servidor de respaldo es razonable y cuesta menos. La regla es pagar el determinismo solo cuando una latencia fuera de límite cuesta más que el hardware.
+
+## 7. Decisión técnica — ¿Conviene cuantizar a INT8 el modelo del Perfil B?
+
+El análisis recomienda cuantizar a INT8 con una condición: validar el recall de la clase defecto por separado. Si el modelo ya cumple 5 ms en FP16, INT8 no hace falta para cumplir la latencia. Su beneficio es el margen. La T4 pasa de 65 TFLOPS en FP16 a 130 TOPS en INT8 (NVIDIA, s.f.-b); el mismo hardware atiende cerca del doble de imágenes. Ese margen absorbe una ampliación de líneas o un modelo más grande sin comprar tarjetas.
+
+El riesgo está en la métrica. Wu et al. (2020) muestran pérdidas de 0.11 a 0.34 puntos de top-1 en ResNet-50 con PTQ. Ese promedio se calcula sobre todas las clases. La clase defecto es minoritaria; sus activaciones extremas son justo las que la calibración recorta. Una caída de 0.3 puntos en el promedio puede esconder varios puntos de recall en esa clase. El caso de BERT con calibración por entropía prueba que una mala escala puede destruir un modelo aunque otro método funcione.
+
+El estudiante decide exigir tres pruebas antes de pasar a producción: recall y precisión de la clase defecto con su intervalo de confianza; matriz de confusión INT8 contra FP16 sobre el mismo conjunto; comparación de varios métodos de calibración. Si el recall de defecto cae más que el margen acordado con calidad, las capas sensibles se mantienen en FP16. La regla es medir la clase que cuesta dinero, no el promedio.
+
+## Conclusiones
+
+El análisis muestra que la GPU es la opción más versátil y la que lidera MLPerf en throughput; la NPU domina en eficiencia cuando el modelo cabe en su memoria local; la TPU escala mejor dentro de Google Cloud; la FPGA ofrece la única latencia determinística. Las cifras de los fabricantes exigen leer la letra pequeña: sparsity en la H100; precio por chip en la TPU; núcleos frente a TOPS en el Neural Engine.
+
+La Parte 1 confirma en pequeño la misma lección. La T4 multiplica por 47 la CPU en el kernel, pero pierde contra la CPU cuando se cuentan las transferencias. El acelerador correcto es el que reduce el costo total del sistema, no el que publica más TOPS.
+
 ## Referencias
 
 AMD. (s.f.). *AMD Alveo U55C high performance compute card*. Recuperado el 19 de noviembre de 2026 de https://www.amd.com/en/products/accelerators/alveo/u55c/a-u55c-p00g-pq-g.html
