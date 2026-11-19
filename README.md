@@ -97,7 +97,23 @@ El kernel de GPU supera a la CPU por un factor de 40 a 47 en vectorAdd porque la
 
 El tiempo total con `cudaMemcpy` es mayor que el de CPU en todos los tamaños medidos: 73.02 ms frente a 36.08 ms con N = 16M. La suma de vectores lee 8 bytes y escribe 4 bytes por cada suma; con memoria paginable el bus entrega unos 2.8 GB/s efectivos y la transferencia consume el 99 % del tiempo total. Con N pequeño el efecto es igual o peor porque la latencia fija de cada copia no se amortiza. La GPU solo compensa cuando los datos ya residen en el dispositivo o cuando la operación hace mucho cómputo por byte transferido. La regla es mover los datos una vez y reutilizarlos muchas veces en la GPU.
 
-## 7. Desviaciones respecto al código guía
+## 7. Decisión técnica 1 — ¿cudaMemcpyAsync con streams o transferencia síncrona para vectorAdd?
+
+El análisis muestra que vectorAdd es memory-bound y que el solapamiento solo oculta la parte menor del pipeline. Con N = 16M se transfieren 201 MB (192 MiB). A 10 a 12 GB/s la transferencia tarda entre 16.8 y 20.1 ms; con los 12.33 GB/s medidos en la T4 tarda 16.3 ms. El kernel tarda 0.775 ms. La transferencia es unas 21 veces mayor que el cómputo.
+
+Si solo se solapara cómputo con copia el ahorro máximo sería el tiempo del kernel: 0.775 ms sobre 16.79 ms; es decir 4.6 %. La reducción medida fue 19.9 % con 4 streams. La diferencia se explica con un dato del entorno: la T4 reporta 3 motores de copia y PCIe es full-duplex. La traza de `nsys` confirma que la D2H de un chunk corre en paralelo con la H2D del siguiente. El ahorro máximo real es entonces el kernel más la copia D2H (0.775 + 5.13 ms). El modelo T = T_H2D + (T_kernel + T_D2H)/S predice 12.36 ms con 4 streams; el valor medido es 13.45 ms.
+
+El estudiante decide no usar streams como optimización principal de vectorAdd. La ganancia existe pero no cambia la conclusión: la GPU total sigue más lenta que dejar los datos en el dispositivo. En matMulTiled el cómputo por chunk crece como O(N³) y puede igualar la transferencia; allí el solapamiento oculta casi todo el tiempo de copia. La regla es usar streams cuando el cómputo por chunk es comparable a su transferencia.
+
+## 8. Decisión técnica 2 — ¿Cuántos streams usar y qué limita la ganancia?
+
+El barrido medido responde la pregunta. De 1 a 2 streams la reducción salta de 0.1 % a 13.6 %; de 2 a 4 sube a 19.6 %; de 4 a 8 a 22.7 %; de 8 a 16 a 23.2 %; con 32 streams baja a 22.1 %. Pasar de 4 a 16 streams no reduce el tiempo de forma proporcional: solo gana 0.6 ms más.
+
+El recurso que limita la ganancia es el bus PCIe Gen3 x16 con sus motores de copia. La T4 tiene 3 motores de copia; uno atiende H2D y otro D2H a la vez. La traza muestra que las copias H2D de distintos streams nunca se solapan entre sí: se ejecutan en fila a unos 12 GB/s. Dividir la transferencia en más streams no crea ancho de banda nuevo; los 134 MB de entrada siempre tardan unos 10.9 ms. Más streams solo reparten esos bytes en trozos más pequeños; el pipeline se llena antes y la cola final es más corta. Con 16 o más streams cada chunk mide 4.2 MB o menos y el costo fijo de lanzar cuatro operaciones por stream empieza a comerse la ganancia; por eso 32 streams es más lento que 16.
+
+El estudiante decide usar 4 streams. Esa cifra captura el 85 % de la mejor reducción medida con un código simple y chunks grandes. La regla es usar tantos streams como motores de copia más uno o dos, no más.
+
+## 9. Desviaciones respecto al código guía
 
 | # | Código guía | Problema detectado | Corrección aplicada |
 |---|---|---|---|
@@ -113,7 +129,7 @@ El tiempo total con `cudaMemcpy` es mayor que el de CPU en todos los tamaños me
 | 10 | La guía habla de 192 MB | 3 × 16 777 216 × 4 B = 201.3 MB = 192 MiB | Se reporta en MB y en MiB |
 | 11 | La guía estima una reducción con streams cercana al 10 % | La T4 tiene 3 motores de copia y solapa H2D con D2H | Se midió 19.9 % y se explicó con la traza de `nsys` |
 
-## 8. Capturas
+## 10. Capturas
 
 | Checkpoint | Capturas |
 |---|---|
