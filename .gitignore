@@ -1,0 +1,7 @@
+# Binarios de nvcc
+vectorAdd
+matMul
+vectorAddStream
+*.o
+*.exe
+*.obj
